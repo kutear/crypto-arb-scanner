@@ -28,6 +28,7 @@ import os
 import json
 import time
 import signal
+import fcntl
 import argparse
 import requests
 from datetime import datetime, timezone, timedelta
@@ -84,6 +85,33 @@ def get_mcp_headers():
 
 HEADERS = get_mcp_headers()
 FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
+
+def get_asset_category(symbol: str) -> tuple:
+    sym = symbol.upper().split('/')[0].split(':')[0].split('_')[0]
+    STOCKS = {
+        'NVDA', 'AAPL', 'TSLA', 'MSFT', 'COIN', 'MSTR', 'OPENAI', 'ANTHROPIC',
+        'SPACEX', 'STRIPE', 'GOOGL', 'GOOG', 'META', 'AMZN', 'BABA', 'PLTR',
+        'ARM', 'NFLX', 'AMD', 'INTC', 'DIS', 'UBER', 'CRWD', 'SNOW', 'SHOP',
+        'HOOD', 'RDDT', 'COINBASE', 'CIRCL', 'H100', 'FIGMA', 'BYTE', 'TIKTOK',
+        'XAI', 'DATABRICKS', 'SCALE'
+    }
+    COMMODITIES = {
+        'XAU', 'XAG', 'GOLD', 'SILVER', 'OIL', 'WTI', 'BRENT', 'CRUDE',
+        'COPPER', 'NATGAS', 'GAS', 'PLATINUM', 'PALLADIUM', 'ALUMINUM',
+        'WHEAT', 'CORN', 'SOYBEAN', 'COFFEE', 'SUGAR', 'URANIUM'
+    }
+    MACRO = {
+        'SP500', 'US500', 'SPX', 'NDX', 'NQ100', 'US100', 'DOW', 'DJI',
+        'DXY', 'EUR', 'GBP', 'JPY', 'CNH', 'AUD', 'CAD', 'CHF', 'FED', 'CPI'
+    }
+    if sym in STOCKS:
+        return '美股/股权 (Stock)', '📈'
+    elif sym in COMMODITIES:
+        return '大宗商品/RWA (Commodity)', '🧈'
+    elif sym in MACRO:
+        return '指数宏观 (Macro)', '🌐'
+    else:
+        return '纯虚拟币 (Crypto)', '🪙'
 
 def log(msg: str):
     now_cst = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S (UTC+8)')
@@ -353,9 +381,32 @@ def process_spread_candidate(candidate):
     if not (depth_b_ok and depth_s_ok):
         return None
 
+    # Fetch current funding rates for buy & sell legs
+    buy_fr_val = 0.0
+    buy_inter = 8
+    sell_fr_val = 0.0
+    sell_inter = 8
+    try:
+        idx_b = call_mcp_tool('get_index', {'exchange': buy_ex, 'symbol': t_buy['symbol']}, timeout=5)
+        if idx_b and idx_b.get('success') and idx_b.get('data'):
+            buy_fr_val = idx_b['data'].get('fundingRate') or 0.0
+            buy_inter = idx_b['data'].get('fundingIntervalHours') or 8
+        idx_s = call_mcp_tool('get_index', {'exchange': sell_ex, 'symbol': t_sell['symbol']}, timeout=5)
+        if idx_s and idx_s.get('success') and idx_s.get('data'):
+            sell_fr_val = idx_s['data'].get('fundingRate') or 0.0
+            sell_inter = idx_s['data'].get('fundingIntervalHours') or 8
+    except Exception:
+        pass
+
+    # Carry yield per day: Long position pays buy_fr, Short position receives sell_fr
+    daily_carry = (sell_fr_val * (24.0 / max(buy_inter, 1))) - (buy_fr_val * (24.0 / max(sell_inter, 1)))
+    cat_name, cat_icon = get_asset_category(symbol)
+
     return {
         'type': 'SPREAD',
         'symbol': symbol,
+        'asset_category': cat_name,
+        'category_icon': cat_icon,
         'strategy_type': 'FF',
         'buy_exchange': buy_ex,
         'sell_exchange': sell_ex,
@@ -363,6 +414,11 @@ def process_spread_candidate(candidate):
         'sell_symbol': t_sell['symbol'],
         'buy_price': b_ask,
         'sell_price': s_bid,
+        'buy_fr': round(buy_fr_val * 100.0, 4),
+        'buy_interval': buy_inter,
+        'sell_fr': round(sell_fr_val * 100.0, 4),
+        'sell_interval': sell_inter,
+        'daily_carry': round(daily_carry * 100.0, 4),
         'nominal_open_spread': round(nominal_open_spread, 3),
         'real_last_spread': round(real_last_spread, 3),
         'bid_ask_loss': round(total_bid_ask_loss, 3),
@@ -540,9 +596,12 @@ def scan_funding_arbitrage():
                 if not (d_ok_a and d_ok_b):
                     continue
 
+                cat_name, cat_icon = get_asset_category(sym)
                 qualified_funding.append({
                     'type': 'FUNDING',
                     'symbol': sym,
+                    'asset_category': cat_name,
+                    'category_icon': cat_icon,
                     'strategy_type': 'FF',
                     'long_exchange': exA,
                     'short_exchange': exB,
@@ -618,10 +677,22 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
             net = o['expected_net_profit']
             depth_k = o['depth_top5_usd'] / 1000.0
             icon = "🟢" if net >= 1.0 else "🔵"
+            cat_name = o.get('asset_category', '纯虚拟币 (Crypto)')
+            cat_icon = o.get('category_icon', '🪙')
+            buy_fr = o.get('buy_fr', 0.0)
+            buy_inter = o.get('buy_interval', 8)
+            sell_fr = o.get('sell_fr', 0.0)
+            sell_inter = o.get('sell_interval', 8)
+            carry = o.get('daily_carry', 0.0)
+            carry_sign = "+" if carry >= 0 else ""
+            carry_icon = "💰正Carry" if carry >= 0 else "🔻负Carry"
+
             block = (
                 f"\n{icon} **{sym}** ｜ `{b_ex} (买多)` ➔ `{s_ex} (卖空)`\n"
+                f"• **标的属性**：{cat_icon} `{cat_name}` ｜ **建议杠杆**：`3x ~ 5x`\n"
                 f"• **预期净利**：**`+{net:.2f}%`** (已扣摩擦) ｜ **综合摩擦**：`{friction:.2f}%`\n"
-                f"• **名义价差**：`+{op:.2f}%` ｜ **P50回归**：`{p50:+.2f}%` ｜ **盘口深度**：`${depth_k:.1f}k`"
+                f"• **开仓价差**：`+{op:.2f}%` ｜ **P50回归**：`{p50:+.2f}%` ｜ **盘口深度**：`${depth_k:.1f}k`\n"
+                f"• **当前资金费**：多端 `{buy_fr:+.4f}%/{buy_inter}h` ｜ 空端 `{sell_fr:+.4f}%/{sell_inter}h` ｜ 净利息: **`{carry_sign}{carry:.4f}%/天`** ({carry_icon})"
             )
             track_a_content.append(block)
 
@@ -654,10 +725,15 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
             win = o['win_rate']
             cycle_str = f"{l_inter}h/{s_inter}h" if l_inter == s_inter else f"{l_inter}hvs{s_inter}h"
             icon = "🔥" if pb <= 0.4 else "⚡"
+            cat_name = o.get('asset_category', '纯虚拟币 (Crypto)')
+            cat_icon = o.get('category_icon', '🪙')
+
             block = (
                 f"\n{icon} **{sym}** ｜ `{l_ex} (多)` ➔ `{s_ex} (空)` ｜ 周期: `{cycle_str}`\n"
+                f"• **标的属性**：{cat_icon} `{cat_name}` ｜ **建议杠杆**：`3x ~ 5x`\n"
                 f"• **24h净费率**：**`+{daily:.4f}%/天`** (折合年化: **`+{apr:.1f}%`**)\n"
-                f"• **回本周期**：**`{pb:.2f} 天`** {icon} ｜ **单期**：`{l_fr:+.2f}% / {s_fr:+.2f}%` ｜ **胜率**：`{win:.0f}%`"
+                f"• **回本周期**：**`{pb:.2f} 天`** {icon} ｜ **9期胜率**：`{win:.0f}%`\n"
+                f"• **当前实时费率**：多端 `{l_fr:+.4f}%/{l_inter}h` ｜ 空端 `{s_fr:+.4f}%/{s_inter}h` ｜ **深度**：`${o.get('depth_top5_usd', 0):.0f}`"
             )
             track_b_content.append(block)
 
@@ -755,6 +831,16 @@ def execute_inspection_cycle(dry_run: bool = False):
     log("================================================================================\n")
     return all_opps
 
+def acquire_process_lock():
+    lock_file = '/tmp/crypto_arbitrage_scanner.lock'
+    try:
+        f = open(lock_file, 'w')
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except (IOError, BlockingIOError):
+        log("⚠️ Another scan instance is already running. Exiting immediately to prevent concurrency overlap.")
+        sys.exit(0)
+
 # ==============================================================================
 # Main Entry Point & Daemon Management
 # ==============================================================================
@@ -765,6 +851,9 @@ def main():
     parser.add_argument('--interval', type=int, default=DEFAULT_SCAN_INTERVAL, help="Scan interval in seconds (default: 1800)")
     parser.add_argument('--dry-run', action='store_true', help="Scan without actually pushing to Feishu")
     args = parser.parse_args()
+
+    # Acquire non-blocking filelock to prevent overlapping execution
+    _lock_handle = acquire_process_lock()
 
     if args.once:
         execute_inspection_cycle(dry_run=args.dry_run)
