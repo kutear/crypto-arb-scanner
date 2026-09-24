@@ -602,16 +602,44 @@ def scan_spread_arbitrage():
     log(f"Track A completed: {len(results)} pairs met strict convergence profit >= 0.50% & Liveness criteria.")
     return results
 
+def fetch_mcp_funding_candidates():
+    """
+    Dynamically extract active candidate symbols from MCP spread snapshot.
+    Pure market data discovery - completely decoupled from downstream Astro execution tools.
+    """
+    mcp_syms = set()
+    try:
+        exchanges_str = ",".join(SUPPORTED_EXCHANGES)
+        res = call_mcp_tool('get_spread_snapshot', {
+            'limit': 500,
+            'sortBy': 'calculated_at',
+            'sortOrder': 'DESC',
+            'exchanges': exchanges_str
+        }, timeout=8)
+        if res and isinstance(res, dict):
+            for d in res.get('data', []):
+                s = d.get('symbol', '')
+                if s and '_' not in s and d.get('arb_type') == 0:
+                    mcp_syms.add(s.upper())
+        log(f"MCP Spread Snapshot dynamically identified {len(mcp_syms)} active market symbols.")
+    except Exception as e:
+        log(f"MCP spread snapshot symbol extraction note: {e}")
+    return list(mcp_syms)
+
 # ==============================================================================
 # Pipeline Track B: Cross-Exchange Funding Rate Arbitrage (24h Normalized)
 # ==============================================================================
 def scan_funding_arbitrage():
     log("Scanning Track B: Cross-Exchange Funding Rate Arbitrage...")
+    # 1. Real-time high-APR funding candidates from market radar
     symbols = fetch_radar_funding_symbols()
-    # Add key high-conviction funding symbols (excluding disconnected/delisted assets)
-    for s in ['SOPH', 'SIREN', 'CVC', 'KERNEL', 'BLAST', 'AVAX', 'DOGE', 'SOL', 'ETH', 'BTC', 'STEEM', 'MINA']:
+
+    # 2. Dynamic active symbols directly from MCP market data (zero hardcoding, zero Astro dependency)
+    for s in fetch_mcp_funding_candidates():
         if s not in symbols:
             symbols.append(s)
+
+    log(f"Track B combined {len(symbols)} dynamic candidate symbols for funding evaluation.")
 
     # Parallel query of funding indexes
     def fetch_index_fr(args):
