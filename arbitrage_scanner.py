@@ -31,6 +31,8 @@ import signal
 import fcntl
 import argparse
 import requests
+import urllib.request
+import ssl
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -443,19 +445,72 @@ def process_spread_candidate(candidate):
         'depth_top5_usd': round(min(depth_b, depth_s), 1)
     }
 
+def fetch_radar_candidates():
+    candidates = []
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        url = "https://perpdexlist.com/api/dashboard/opportunities?mode=basis&exchanges=binance,bybit,gateio,bitget,hyperliquid,lighter,lighter_rh,okx&per_page=40"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, context=ctx, timeout=6) as r:
+            data = json.loads(r.read())
+        for o in data.get('opportunities', []):
+            sym = o.get('asset', '')
+            b_ex = o.get('long', {}).get('exchange', '').replace('gateio', 'gate').replace('lighter_rh', 'lighter')
+            s_ex = o.get('short', {}).get('exchange', '').replace('gateio', 'gate').replace('lighter_rh', 'lighter')
+            b_ask = o.get('long', {}).get('ask', 0)
+            s_bid = o.get('short', {}).get('bid', 0)
+            op = (o.get('basis_pct') or 0) / 100.0
+            if b_ex in SUPPORTED_EXCHANGES and s_ex in SUPPORTED_EXCHANGES and b_ex != s_ex and op >= 0.007:
+                candidates.append({
+                    'symbol': sym,
+                    'buy_exchange': b_ex,
+                    'sell_exchange': s_ex,
+                    'buy_ask': b_ask,
+                    'sell_bid': s_bid,
+                    'open_rate': op,
+                    'arb_type': 0
+                })
+        log(f"PerpDex Radar identified {len(candidates)} high-potential basis candidates.")
+    except Exception as e:
+        log(f"PerpDex Radar basis note: {e}")
+    return candidates
+
+def fetch_radar_funding_symbols():
+    syms = []
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        url = "https://perpdexlist.com/api/dashboard/opportunities?mode=funding&exchanges=binance,bybit,gateio,bitget,hyperliquid,lighter,lighter_rh,okx&per_page=30"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, context=ctx, timeout=6) as r:
+            data = json.loads(r.read())
+        for o in data.get('opportunities', []):
+            sym = o.get('asset', '')
+            if sym and '_' not in sym and sym not in syms:
+                syms.append(sym)
+        log(f"PerpDex Radar identified {len(syms)} high-APR funding symbols.")
+    except Exception as e:
+        log(f"PerpDex Radar funding note: {e}")
+    return syms
+
 def scan_spread_arbitrage():
     log("Scanning Track A: Cross-Exchange Spatial Basis Spread...")
+    candidates = fetch_radar_candidates()
+    seen = {(c['symbol'], c['buy_exchange'], c['sell_exchange']) for c in candidates}
+
+    # Also pull from MCP spread snapshot
     exchanges_param = ",".join(SUPPORTED_EXCHANGES)
     res = call_mcp_tool('get_spread_snapshot', {
-        'limit': 1000,
+        'limit': 100,
         'sortBy': 'open_rate',
         'sortOrder': 'DESC',
         'exchanges': exchanges_param
     }, timeout=15)
 
     data = res.get('data', []) if isinstance(res, dict) else []
-    candidates = []
-    seen = set()
     for d in data:
         sym = d.get('symbol', '')
         if '_' in sym or d.get('arb_type') != 0:
@@ -497,19 +552,9 @@ def scan_spread_arbitrage():
 # ==============================================================================
 def scan_funding_arbitrage():
     log("Scanning Track B: Cross-Exchange Funding Rate Arbitrage...")
-    # Seed symbols from snapshot
-    exchanges_param = ",".join(SUPPORTED_EXCHANGES)
-    res = call_mcp_tool('get_spread_snapshot', {
-        'limit': 300,
-        'sortBy': 'open_rate',
-        'sortOrder': 'DESC',
-        'exchanges': exchanges_param
-    }, timeout=12)
-
-    data = res.get('data', []) if isinstance(res, dict) else []
-    symbols = list(dict.fromkeys([d['symbol'] for d in data if '_' not in d.get('symbol', '')]))
+    symbols = fetch_radar_funding_symbols()
     # Add key high-conviction funding symbols
-    for s in ['SOPH', 'SIREN', 'CVC', 'KERNEL', 'BLAST', 'AVAX', 'DOGE', 'SOL', 'ETH', 'BTC']:
+    for s in ['SOPH', 'SIREN', 'CVC', 'KERNEL', 'BLAST', 'AVAX', 'DOGE', 'SOL', 'ETH', 'BTC', 'ONE', 'STEEM', 'MINA']:
         if s not in symbols:
             symbols.append(s)
 
