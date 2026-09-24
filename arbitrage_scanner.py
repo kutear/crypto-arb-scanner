@@ -602,14 +602,11 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
         }
     })
 
-    # Track A Table (if any)
+    # Track A Blocks (if any)
     if spread_opps:
         elements.append({"tag": "hr"})
-        track_a_rows = [
-            "**📊 空间价差均值回归套利 (Track A)**\n*已扣除双边买卖点差损耗 (BidAskLoss) 与 0.20% 手续费摩擦，预期净利润 >= 0.50%*",
-            "",
-            "| 标的 | 方向 (买入多 ➔ 卖出空) | 名义价差 | 综合摩擦 | P50回归 | **预期净利** | 盘口深度 |",
-            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: |"
+        track_a_content = [
+            "**📊 空间价差均值回归套利 (Track A)**\n*已扣除双边买卖点差损耗 (BidAskLoss) 与 0.20% 手续费摩擦，预期净利润 >= 0.50%*"
         ]
         for o in spread_opps:
             sym = o['symbol']
@@ -621,24 +618,26 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
             net = o['expected_net_profit']
             depth_k = o['depth_top5_usd'] / 1000.0
             icon = "🟢" if net >= 1.0 else "🔵"
-            track_a_rows.append(f"| **{sym}** | {b_ex} ➔ {s_ex} | +{op:.2f}% | {friction:.2f}% | {p50:+.2f}% | **+{net:.2f}%** {icon} | ${depth_k:.1f}k |")
+            block = (
+                f"\n{icon} **{sym}** ｜ `{b_ex} (买多)` ➔ `{s_ex} (卖空)`\n"
+                f"• **预期净利**：**`+{net:.2f}%`** (已扣摩擦) ｜ **综合摩擦**：`{friction:.2f}%`\n"
+                f"• **名义价差**：`+{op:.2f}%` ｜ **P50回归**：`{p50:+.2f}%` ｜ **盘口深度**：`${depth_k:.1f}k`"
+            )
+            track_a_content.append(block)
 
         elements.append({
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": "\n".join(track_a_rows)
+                "content": "\n".join(track_a_content)
             }
         })
 
-    # Track B Table (if any)
+    # Track B Blocks (if any)
     if funding_opps:
         elements.append({"tag": "hr"})
-        track_b_rows = [
-            "**💎 资金费率反向对冲套利 (Track B - 24h归一化)**\n*已按 24h 费率归一化折算，并对齐结算周期，要求 9 期胜率 >= 70% 且回本 < 3 天*",
-            "",
-            "| 标的 | 对冲方向 (多端 ➔ 空端) | 周期 | 单期费率 (多/空) | **24h净费率** | **年化APR** | **回本周期** | 胜率 |",
-            "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |"
+        track_b_content = [
+            "**💎 资金费率反向对冲套利 (Track B - 24h归一化)**\n*已按 24h 费率归一化折算，LCM 周期锁定，要求 9 期胜率 >= 70% 且回本 < 3 天*"
         ]
         sorted_funding = sorted(funding_opps, key=lambda x: x.get('payback_days', 99))
         for o in sorted_funding:
@@ -655,13 +654,18 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
             win = o['win_rate']
             cycle_str = f"{l_inter}h/{s_inter}h" if l_inter == s_inter else f"{l_inter}hvs{s_inter}h"
             icon = "🔥" if pb <= 0.4 else "⚡"
-            track_b_rows.append(f"| **{sym}** | {l_ex} ➔ {s_ex} | {cycle_str} | {l_fr:+.2f}%/{s_fr:+.2f}% | **+{daily:.4f}%/天** | **+{apr:.1f}%** | **{pb:.2f}天** {icon} | {win:.0f}% |")
+            block = (
+                f"\n{icon} **{sym}** ｜ `{l_ex} (多)` ➔ `{s_ex} (空)` ｜ 周期: `{cycle_str}`\n"
+                f"• **24h净费率**：**`+{daily:.4f}%/天`** (折合年化: **`+{apr:.1f}%`**)\n"
+                f"• **回本周期**：**`{pb:.2f} 天`** {icon} ｜ **单期**：`{l_fr:+.2f}% / {s_fr:+.2f}%` ｜ **胜率**：`{win:.0f}%`"
+            )
+            track_b_content.append(block)
 
         elements.append({
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": "\n".join(track_b_rows)
+                "content": "\n".join(track_b_content)
             }
         })
 
