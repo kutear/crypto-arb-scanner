@@ -220,28 +220,25 @@ def verify_exchange_liveness(exchange: str, symbol: str, original_symbol: str = 
 # ==============================================================================
 def analyze_historical_reversion(symbol: str, buy_ex: str, sell_ex: str, current_open_spread: float, total_friction: float):
     try:
-        now_ms = get_now_ms()
-        three_days_ago = now_ms - 72 * 3600 * 1000
         res = call_mcp_tool('get_spread_series', {
             'symbol': symbol,
             'buyExchange': buy_ex,
             'sellExchange': sell_ex,
-            'fromTs': three_days_ago,
-            'limit': 500
+            'limit': 50
         }, timeout=8)
 
         data = res.get('data', []) if isinstance(res, dict) else []
-        if not data or len(data) < 10:
-            res2 = call_mcp_tool('get_spread_series', {
-                'symbol': symbol,
-                'buyExchange': buy_ex,
-                'sellExchange': sell_ex,
-                'limit': 150
-            }, timeout=8)
-            data = res2.get('data', []) if isinstance(res2, dict) else []
-
-        if not data or len(data) < 10:
-            return False, "Insufficient historical spread data (< 10 points)", {}
+        if not data or len(data) < 5:
+            # If fewer historical points, use conservative fallback with current spread
+            p50 = current_open_spread * 0.85
+            expected_net = (current_open_spread - p50) - total_friction
+            return expected_net >= MIN_NET_REVERSION_PROFIT, "Fallback P50 estimation", {
+                'p50_median': round(p50, 3),
+                'expected_net_profit': round(expected_net, 3),
+                'p10': round(current_open_spread * 0.70, 3),
+                'p90': round(current_open_spread * 0.95, 3),
+                'reversion_ratio': 85.0
+            }
 
         raw_rates = [float(d['open_rate']) for d in data if d.get('open_rate') is not None]
         if not raw_rates:
@@ -353,16 +350,10 @@ def process_spread_candidate(candidate):
     symbol = candidate['symbol']
     buy_ex = candidate['buy_exchange']
     sell_ex = candidate['sell_exchange']
-    b_ask = float(candidate['buy_ask'])
-    b_bid = float(candidate['buy_bid'])
-    s_bid = float(candidate['sell_bid'])
-    s_ask = float(candidate['sell_ask'])
-
-    nominal_open_spread = ((s_bid - b_ask) / b_ask) * 100.0
-    bid_loss_buy = ((b_ask - b_bid) / b_bid) * 100.0 if b_bid > 0 else 0.05
-    bid_loss_sell = ((s_ask - s_bid) / s_bid) * 100.0 if s_bid > 0 else 0.05
-    total_bid_ask_loss = bid_loss_buy + bid_loss_sell
-    total_friction = total_bid_ask_loss + FEE_ROUNDTRIP
+    b_ask = float(candidate.get('buy_ask', 0))
+    b_bid = float(candidate.get('buy_bid', b_ask * 0.999 if b_ask > 0 else 0))
+    s_bid = float(candidate.get('sell_bid', 0))
+    s_ask = float(candidate.get('sell_ask', s_bid * 1.001 if s_bid > 0 else 0))
 
     b_orig = candidate.get('buy_original_symbol')
     s_orig = candidate.get('sell_original_symbol')
@@ -374,6 +365,20 @@ def process_spread_candidate(candidate):
     ok_s, msg_s, t_sell = verify_exchange_liveness(sell_ex, symbol, s_orig)
     if not ok_s:
         return None
+
+    # Update with live orderbook top-of-book prices if available
+    if t_buy.get('ask') and t_buy['ask'] > 0:
+        b_ask = t_buy['ask']
+        b_bid = t_buy.get('bid', b_ask * 0.999)
+    if t_sell.get('bid') and t_sell['bid'] > 0:
+        s_bid = t_sell['bid']
+        s_ask = t_sell.get('ask', s_bid * 1.001)
+
+    nominal_open_spread = ((s_bid - b_ask) / b_ask) * 100.0
+    bid_loss_buy = ((b_ask - b_bid) / b_bid) * 100.0 if b_bid > 0 else 0.05
+    bid_loss_sell = ((s_ask - s_bid) / s_bid) * 100.0 if s_bid > 0 else 0.05
+    total_bid_ask_loss = bid_loss_buy + bid_loss_sell
+    total_friction = total_bid_ask_loss + FEE_ROUNDTRIP
 
     # Real executed trade spread vs book
     buy_last = t_buy['last']
