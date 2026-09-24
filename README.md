@@ -1,8 +1,22 @@
 # Crypto Arbitrage Scanner (Zero-Token Programmatic Inspection)
 
-全市场跨所加密货币量化套利机会监控系统。纯 Python 独立运行，不产生任何 LLM API Token 消耗。
+全市场跨所加密货币量化套利机会监控系统。纯 Python 独立运行，不产生任何 LLM API Token 消耗。使用 Astral **uv** 进行包管理与极速依赖解析。
 
 支持全市场空间价差套利（Track A）与资金费率对冲套利（Track B - 24h归一化）双轨监控，内置严苛的六道硬核风控网（Gate 1~6），发现高质量机会时自动向飞书群推送单张高信息密度的交互式汇总表格卡片。
+
+---
+
+## ⚡ 包管理器：Astral `uv`
+
+本项目基于现代 Python 工具链 **`uv`**（pyproject.toml + uv.lock），实现极速依赖解析与开箱即用运行环境。
+
+```bash
+# 1. 安装与同步依赖
+uv sync
+
+# 2. 极速运行扫描器
+uv run arbitrage_scanner.py --once
+```
 
 ---
 
@@ -10,7 +24,10 @@
 
 本项目已预配置为 **Public 仓库模式**，在 GitHub Actions 上享受 **完全免费、无分钟数配额限制** 的定时巡检服务。
 
-工作流定义位于 `.github/workflows/arbitrage_scan.yml`，设置每 10 分钟自动巡检一次（`cron: '*/10 * * * *'`）。
+工作流定义位于 `.github/workflows/arbitrage_scan.yml`：
+- 采用官方 `astral-sh/setup-uv@v5`，启动与依赖准备仅需 **1 秒**；
+- 调度配置：`cron: '*/10 * * * *'`（每 10 分钟自动巡检一次）；
+- 支持在 Actions 界面随时单次手动触发（`workflow_dispatch`）。
 
 ### 必填 Secrets 配置
 
@@ -29,24 +46,20 @@
 
 ## 🛠️ 本地运行与调试
 
-### 1. 安装依赖
-```bash
-pip install -r requirements.txt
-```
-
-### 2. 设置环境变量并单次执行
+### 1. 设置环境变量
 ```bash
 export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/..."
 export CF_CLIENT_ID="<your-cf-access-client-id>"
 export CF_CLIENT_SECRET="<your-cf-access-client-secret>"
-
-# 单次执行并推送汇总表格
-python arbitrage_scanner.py --once
 ```
 
-### 3. 本地 Dry-run（只扫描测算，不推飞书）
+### 2. 使用 uv 运行
 ```bash
-python arbitrage_scanner.py --once --dry-run
+# 单次执行并推送汇总表格
+uv run arbitrage_scanner.py --once
+
+# Dry-run 模式（只扫描测算，不推飞书）
+uv run arbitrage_scanner.py --once --dry-run
 ```
 
 ---
