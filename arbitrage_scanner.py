@@ -44,6 +44,10 @@ MAX_PAYBACK_DAYS = 3.0            # 3 days max funding payback period
 MIN_FUNDING_WIN_RATE = 70.0       # 70% min historical funding win rate
 MAX_SLIPPAGE = 0.05               # Max 0.05% slippage
 FEE_ROUNDTRIP = 0.20             # 0.20% roundtrip fees (4 legs)
+MAX_ADVERSE_SPREAD = 2.0          # Max 2.0% adverse entry spread for funding arb
+MAX_TOTAL_ENTRY_FRICTION = 3.0    # Max 3.0% total entry friction for funding arb
+MIN_PRICE_RATIO = 0.85            # Min price ratio (0.85 <= P_b / P_a <= 1.15)
+MAX_PRICE_RATIO = 1.15            # Max price ratio
 DEFAULT_SCAN_INTERVAL = 1800      # 30 minutes in daemon mode
 
 SUPPORTED_EXCHANGES = ['binance', 'bybit', 'gate', 'bitget', 'okx', 'hyperliquid', 'lighter']
@@ -108,7 +112,7 @@ def get_asset_category(symbol: str) -> tuple:
         'SPACEX', 'STRIPE', 'GOOGL', 'GOOG', 'META', 'AMZN', 'BABA', 'PLTR',
         'ARM', 'NFLX', 'AMD', 'INTC', 'DIS', 'UBER', 'CRWD', 'SNOW', 'SHOP',
         'HOOD', 'RDDT', 'COINBASE', 'CIRCL', 'H100', 'FIGMA', 'BYTE', 'TIKTOK',
-        'XAI', 'DATABRICKS', 'SCALE'
+        'DATABRICKS', 'SCALE'
     }
     COMMODITIES = {
         'XAU', 'XAG', 'GOLD', 'SILVER', 'OIL', 'WTI', 'BRENT', 'CRUDE',
@@ -178,6 +182,33 @@ def call_mcp_tool(tool_name: str, arguments: dict = None, timeout: int = 18, ret
 
 def get_now_ms():
     return int(time.time() * 1000)
+
+# ==============================================================================
+# Gate 2: Delisting & Suspension Filter
+# ==============================================================================
+def verify_currency_health(index_data: dict) -> tuple:
+    """
+    Gate 2: Delisting & suspended market filter.
+    Returns (is_healthy, reason).
+    """
+    if not index_data or not isinstance(index_data, dict):
+        return True, "No index data"
+    if index_data.get('isDelisted'):
+        return False, "Market is delisted"
+    market_status = index_data.get('marketStatus')
+    if market_status and str(market_status).lower() not in ('active', 'open', 'trading', 'true'):
+        return False, f"Market status inactive ({market_status})"
+
+    tc = index_data.get('transferCurrency')
+    if isinstance(tc, dict):
+        tc_active = tc.get('active')
+        tc_dep = tc.get('deposit')
+        tc_wd = tc.get('withdraw')
+        if tc_active is False and (tc_dep is False and tc_wd is False):
+            return False, "Currency inactive with deposit & withdrawal suspended"
+        if tc_dep is False and tc_wd is False:
+            return False, "Both deposit & withdrawal suspended"
+    return True, "Healthy"
 
 # ==============================================================================
 # Gate 3: Liveness & Real Executed Trade Price (Last) Verification
@@ -414,7 +445,7 @@ def process_spread_candidate(candidate):
     if not (depth_b_ok and depth_s_ok):
         return None
 
-    # Fetch current funding rates for buy & sell legs
+    # Fetch current funding rates and verify Gate 2 currency health for buy & sell legs
     buy_fr_val = 0.0
     buy_inter = 8
     sell_fr_val = 0.0
@@ -422,10 +453,16 @@ def process_spread_candidate(candidate):
     try:
         idx_b = call_mcp_tool('get_index', {'exchange': buy_ex, 'symbol': t_buy['symbol']}, timeout=5)
         if idx_b and idx_b.get('success') and idx_b.get('data'):
+            healthy_b, _ = verify_currency_health(idx_b['data'])
+            if not healthy_b:
+                return None
             buy_fr_val = idx_b['data'].get('fundingRate') or 0.0
             buy_inter = idx_b['data'].get('fundingIntervalHours') or 8
         idx_s = call_mcp_tool('get_index', {'exchange': sell_ex, 'symbol': t_sell['symbol']}, timeout=5)
         if idx_s and idx_s.get('success') and idx_s.get('data'):
+            healthy_s, _ = verify_currency_health(idx_s['data'])
+            if not healthy_s:
+                return None
             sell_fr_val = idx_s['data'].get('fundingRate') or 0.0
             sell_inter = idx_s['data'].get('fundingIntervalHours') or 8
     except Exception:
@@ -571,8 +608,8 @@ def scan_spread_arbitrage():
 def scan_funding_arbitrage():
     log("Scanning Track B: Cross-Exchange Funding Rate Arbitrage...")
     symbols = fetch_radar_funding_symbols()
-    # Add key high-conviction funding symbols
-    for s in ['SOPH', 'SIREN', 'CVC', 'KERNEL', 'BLAST', 'AVAX', 'DOGE', 'SOL', 'ETH', 'BTC', 'ONE', 'STEEM', 'MINA']:
+    # Add key high-conviction funding symbols (excluding disconnected/delisted assets)
+    for s in ['SOPH', 'SIREN', 'CVC', 'KERNEL', 'BLAST', 'AVAX', 'DOGE', 'SOL', 'ETH', 'BTC', 'STEEM', 'MINA']:
         if s not in symbols:
             symbols.append(s)
 
@@ -585,6 +622,10 @@ def scan_funding_arbitrage():
                 idx = call_mcp_tool('get_index', {'exchange': ex, 'symbol': f'{sym}/USDC:USDC'}, timeout=6)
             if idx and idx.get('success') and idx.get('data'):
                 d = idx['data']
+                # Gate 2: Currency health, delisting, and suspension filter
+                is_healthy, _ = verify_currency_health(d)
+                if not is_healthy:
+                    return None
                 fr = d.get('fundingRate')
                 inter = d.get('fundingIntervalHours') or 8
                 next_ts = d.get('nextFundingTimestamp')
@@ -637,10 +678,23 @@ def scan_funding_arbitrage():
                 # Open spread friction (buying A at ask, selling B at bid)
                 price_a = t_a['ask']
                 price_b = t_b['bid']
+                if price_a <= 0 or price_b <= 0:
+                    continue
+
+                # Gate 1: Price ratio alignment (0.85 <= P_b / P_a <= 1.15) to eliminate decoupled markets
+                price_ratio = price_b / price_a
+                if not (MIN_PRICE_RATIO <= price_ratio <= MAX_PRICE_RATIO):
+                    continue
+
                 open_spread = ((price_b - price_a) / price_a) * 100.0
-                bid_ask_loss = ((t_a['ask'] - t_a['bid'])/t_a['bid'] + (t_b['ask'] - t_b['bid'])/t_b['bid']) * 100.0
                 adverse_spread_cost = max(0.0, -open_spread)
+                if adverse_spread_cost > MAX_ADVERSE_SPREAD:
+                    continue
+
+                bid_ask_loss = ((t_a['ask'] - t_a['bid'])/t_a['bid'] + (t_b['ask'] - t_b['bid'])/t_b['bid']) * 100.0
                 total_entry_cost = adverse_spread_cost + bid_ask_loss + FEE_ROUNDTRIP
+                if total_entry_cost > MAX_TOTAL_ENTRY_FRICTION:
+                    continue
 
                 payback_days = total_entry_cost / (net_daily * 100.0)
                 if payback_days > MAX_PAYBACK_DAYS:
