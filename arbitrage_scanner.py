@@ -117,7 +117,7 @@ def log(msg: str):
     now_cst = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S (UTC+8)')
     print(f"[{now_cst}] {msg}", flush=True)
 
-def call_mcp_tool(tool_name: str, arguments: dict = None, timeout: int = 12):
+def call_mcp_tool(tool_name: str, arguments: dict = None, timeout: int = 18, retries: int = 2):
     if arguments is None:
         arguments = {}
     payload = {
@@ -129,23 +129,36 @@ def call_mcp_tool(tool_name: str, arguments: dict = None, timeout: int = 12):
             "arguments": arguments
         }
     }
-    resp = requests.post(MCP_URL, headers=HEADERS, json=payload, timeout=timeout)
-    if resp.status_code != 200:
-        raise RuntimeError(f"MCP request failed with status {resp.status_code}: {resp.text}")
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(MCP_URL, headers=HEADERS, json=payload, timeout=timeout)
+            if resp.status_code != 200:
+                if attempt == retries:
+                    log(f"MCP request failed ({tool_name}) status {resp.status_code}")
+                    return None
+                time.sleep(1)
+                continue
 
-    for line in resp.text.splitlines():
-        if line.startswith("data: "):
-            data = json.loads(line[6:])
-            if "error" in data:
-                raise RuntimeError(f"MCP error: {data['error']}")
-            content = data.get("result", {}).get("content", [])
-            for c in content:
-                if c.get("type") == "text":
-                    try:
-                        return json.loads(c.get("text", "{}"))
-                    except Exception:
-                        return c.get("text")
-            return data.get("result")
+            for line in resp.text.splitlines():
+                if line.startswith("data: "):
+                    data = json.loads(line[6:])
+                    if "error" in data:
+                        log(f"MCP error ({tool_name}): {data['error']}")
+                        return None
+                    content = data.get("result", {}).get("content", [])
+                    for c in content:
+                        if c.get("type") == "text":
+                            try:
+                                return json.loads(c.get("text", "{}"))
+                            except Exception:
+                                return c.get("text")
+                    return data.get("result")
+            return None
+        except Exception as e:
+            if attempt == retries:
+                log(f"MCP call failed after {retries} retries ({tool_name}): {e}")
+                return None
+            time.sleep(1.5)
     return None
 
 def get_now_ms():
@@ -657,7 +670,7 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
         "tag": "div",
         "text": {
             "tag": "lark_md",
-            "content": f"**【全市场双轨扫描概览】**\n• **监控标的**：105 组活跃跨所流动性池 ｜ **严苛风控**：Gate 1~6 终极过滤\n• **命中套利对**：空间价差套利 **{len(spread_opps)} 组** ｜ 资金费率反向对冲 **{len(funding_opps)} 组**"
+            "content": f"**【全市场双轨扫描概览】**\n ├ **监控标的**：105 组活跃跨所流动性池 ｜ **严苛风控**：Gate 1~6 终极过滤\n └ **命中套利对**：空间价差套利 **{len(spread_opps)} 组** ｜ 资金费率反向对冲 **{len(funding_opps)} 组**"
         }
     })
 
@@ -689,10 +702,10 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
 
             block = (
                 f"\n{icon} **{sym}** ｜ `{b_ex} (买多)` ➔ `{s_ex} (卖空)`\n"
-                f"• **标的属性**：{cat_icon} `{cat_name}` ｜ **建议杠杆**：`3x ~ 5x`\n"
-                f"• **预期净利**：**`+{net:.2f}%`** (已扣摩擦) ｜ **综合摩擦**：`{friction:.2f}%`\n"
-                f"• **开仓价差**：`+{op:.2f}%` ｜ **P50回归**：`{p50:+.2f}%` ｜ **盘口深度**：`${depth_k:.1f}k`\n"
-                f"• **当前资金费**：多端 `{buy_fr:+.4f}%/{buy_inter}h` ｜ 空端 `{sell_fr:+.4f}%/{sell_inter}h` ｜ 净利息: **`{carry_sign}{carry:.4f}%/天`** ({carry_icon})"
+                f" ├ **标的属性**：{cat_icon} `{cat_name}` ｜ **建议杠杆**：`3x ~ 5x`\n"
+                f" ├ **预期净利**：**`+{net:.2f}%`** (已扣摩擦) ｜ **综合摩擦**：`{friction:.2f}%`\n"
+                f" ├ **开仓价差**：`+{op:.2f}%` ｜ **P50回归**：`{p50:+.2f}%` ｜ **盘口深度**：`${depth_k:.1f}k`\n"
+                f" └ **当前资金费**：多端 `{buy_fr:+.4f}%/{buy_inter}h` ｜ 空端 `{sell_fr:+.4f}%/{sell_inter}h` ｜ 净利息: **`{carry_sign}{carry:.4f}%/天`** ({carry_icon})"
             )
             track_a_content.append(block)
 
@@ -730,10 +743,10 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
 
             block = (
                 f"\n{icon} **{sym}** ｜ `{l_ex} (多)` ➔ `{s_ex} (空)` ｜ 周期: `{cycle_str}`\n"
-                f"• **标的属性**：{cat_icon} `{cat_name}` ｜ **建议杠杆**：`3x ~ 5x`\n"
-                f"• **24h净费率**：**`+{daily:.4f}%/天`** (折合年化: **`+{apr:.1f}%`**)\n"
-                f"• **回本周期**：**`{pb:.2f} 天`** {icon} ｜ **9期胜率**：`{win:.0f}%`\n"
-                f"• **当前实时费率**：多端 `{l_fr:+.4f}%/{l_inter}h` ｜ 空端 `{s_fr:+.4f}%/{s_inter}h` ｜ **深度**：`${o.get('depth_top5_usd', 0):.0f}`"
+                f" ├ **标的属性**：{cat_icon} `{cat_name}` ｜ **建议杠杆**：`3x ~ 5x`\n"
+                f" ├ **24h净费率**：**`+{daily:.4f}%/天`** (折合年化: **`+{apr:.1f}%`**)\n"
+                f" ├ **回本周期**：**`{pb:.2f} 天`** {icon} ｜ **9期胜率**：`{win:.0f}%`\n"
+                f" └ **当前实时费率**：多端 `{l_fr:+.4f}%/{l_inter}h` ｜ 空端 `{s_fr:+.4f}%/{s_inter}h` ｜ **深度**：`${o.get('depth_top5_usd', 0):.0f}`"
             )
             track_b_content.append(block)
 
@@ -752,7 +765,7 @@ def push_feishu_summary_card(spread_opps: list, funding_opps: list, dry_run: boo
         "tag": "div",
         "text": {
             "tag": "lark_md",
-            "content": f"**🛡️ 风控终审结论 (Gate 1~6 全项通过)**\n• **标的与深度**：真实指数构成一致，买卖前 5 档深度充足 (${min_depth:.0f}+ USD)，模拟建仓滑点 < 0.05%\n• **排除死锁高溢价**：均经 48h~72h 历史序列检验，当前价差显著高于历史中位数 P50，具备强均值回归动能\n• **跨所周期对齐**：资金费率已日化归一，多空持仓建议按最小公倍数 (LCM) 周期窗口执行"
+            "content": f"**🛡️ 风控终审结论 (Gate 1~6 全项通过)**\n ├ **标的与深度**：真实指数构成一致，买卖前 5 档深度充足 (${min_depth:.0f}+ USD)，模拟建仓滑点 < 0.05%\n ├ **排除死锁高溢价**：均经 48h~72h 历史序列检验，当前价差显著高于历史中位数 P50，具备强均值回归动能\n └ **跨所周期对齐**：资金费率已日化归一，多空持仓建议按最小公倍数 (LCM) 周期窗口执行"
         }
     })
 
