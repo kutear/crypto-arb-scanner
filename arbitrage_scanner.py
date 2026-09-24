@@ -48,9 +48,22 @@ DEFAULT_SCAN_INTERVAL = 1800      # 30 minutes in daemon mode
 
 SUPPORTED_EXCHANGES = ['binance', 'bybit', 'gate', 'bitget', 'okx', 'hyperliquid', 'lighter']
 
+# Try loading .env if exists
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+if os.path.exists(env_path):
+    try:
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+
 # Load MCP Config & Feishu Webhook
 MCP_URL = os.environ.get('MCP_SERVER_URL', 'https://arb-mcp.kutear.com/mcp')
-FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
+FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', 'https://open.feishu.cn/open-apis/bot/v2/hook/735f1d69-d99e-40ae-837a-1c4557c02580')
 
 def get_mcp_headers():
     cf_id = os.environ.get('CF_CLIENT_ID', '').strip()
@@ -86,7 +99,7 @@ def get_mcp_headers():
     return headers
 
 HEADERS = get_mcp_headers()
-FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', '')
+FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', 'https://open.feishu.cn/open-apis/bot/v2/hook/735f1d69-d99e-40ae-837a-1c4557c02580')
 
 def get_asset_category(symbol: str) -> tuple:
     sym = symbol.upper().split('/')[0].split(':')[0].split('_')[0]
@@ -923,7 +936,7 @@ def main():
         return
 
     if args.daemon:
-        pid_file = '/home/agy-worker4/multica_workspaces_worker4/crypto-arb-23a375a57ad2/task-8c53a5889173/workdir/arbitrage_daemon.pid'
+        pid_file = os.path.expanduser('~/.arbitrage_daemon.pid')
         with open(pid_file, 'w') as f:
             f.write(str(os.getpid()))
 
