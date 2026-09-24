@@ -20,13 +20,13 @@ uv run arbitrage_scanner.py --once
 
 ---
 
-## 🚀 GitHub Actions 自动化配置 (10分钟/次)
+## 🚀 GitHub Actions 自动化配置 (每小时/次)
 
 本项目已预配置为 **Public 仓库模式**，在 GitHub Actions 上享受 **完全免费、无分钟数配额限制** 的定时巡检服务。
 
 工作流定义位于 `.github/workflows/arbitrage_scan.yml`：
 - 采用官方 `astral-sh/setup-uv@v5`，启动与依赖准备仅需 **1 秒**；
-- 调度配置：`cron: '*/10 * * * *'`（每 10 分钟自动巡检一次）；
+- 调度配置：`cron: '15 * * * *'`（每小时第 15 分钟错峰自动巡检，规避整点拥堵）；
 - 支持在 Actions 界面随时单次手动触发（`workflow_dispatch`）。
 
 ### 必填 Secrets 配置

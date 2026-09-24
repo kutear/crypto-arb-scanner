@@ -1,9 +1,9 @@
-name: Crypto Arbitrage Scanner (10-Min Cron via uv)
+name: Crypto Arbitrage Scanner (Hourly Cron via uv)
 
 on:
   schedule:
-    # 错峰每 10 分钟执行一次 (避开全球整点/整10分的极度拥堵队列，大幅降低排队延迟)
-    - cron: '3,13,23,33,43,53 * * * *'
+    # 每小时执行一次 (选择第 15 分钟错峰执行，避开整点拥堵高峰)
+    - cron: '15 * * * *'
   workflow_dispatch: # 支持在 GitHub Web 界面随时手动点击触发执行
 
 jobs:
