@@ -105,32 +105,107 @@ def get_mcp_headers():
 HEADERS = get_mcp_headers()
 FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', 'https://open.feishu.cn/open-apis/bot/v2/hook/735f1d69-d99e-40ae-837a-1c4557c02580')
 
-def get_asset_category(symbol: str) -> tuple:
+def get_asset_category(symbol: str, index_data_list: list = None) -> tuple:
+    """
+    Dynamically identify asset category using live exchange Index & Market metadata,
+    preventing false positives on crypto tokens (e.g. GAS, CORN, BYTE).
+    Returns (category_name, category_icon).
+    """
     sym = symbol.upper().split('/')[0].split(':')[0].split('_')[0]
-    STOCKS = {
+
+    # 0. Strict Anti-Collision Guard: Tokens that MUST be treated as Crypto
+    CRYPTO_OVERRIDE = {
+        'GAS',   # NEO GAS token (not natural gas)
+        'CORN',  # Corn DeFi token (not agriculture corn)
+        'BYTE',  # ERC20 Meme coin (not ByteDance stock)
+        'SCALE', # SKALE / Scale token
+        'XAI',   # Arbitrum gaming L3 token (not xAI)
+        'ONE',   # Harmony ONE token
+        'SUN',   # Tron SUN token
+        'MOON',  # Moon token
+        'STAR',  # Star token
+    }
+    if sym in CRYPTO_OVERRIDE:
+        return '纯虚拟币 (Crypto)', '🪙'
+
+    # 1. Primary: Dynamic metadata from live Index & Market payloads
+    if index_data_list:
+        for idx_d in index_data_list:
+            if not idx_d or not isinstance(idx_d, dict):
+                continue
+
+            raw_sym = (idx_d.get('symbol') or '').upper()
+
+            # (A) Hyperliquid Builder synthetics prefix (xyz:)
+            if 'XYZ:' in raw_sym or raw_sym.startswith('XYZ'):
+                base = raw_sym.split('/')[0].replace('XYZ:', '').replace('XYZ', '')
+                if base in ('GOLD', 'SILVER', 'OIL', 'WTI', 'BRENT', 'XAU', 'XAG', 'COPPER'):
+                    return '大宗商品/RWA (Commodity)', '🧈'
+                if base in ('100', 'XYZ100', 'SP500', 'US500', 'SPX', 'NDX'):
+                    return '指数宏观 (Macro)', '🌐'
+                return '美股/股权 (Stock)', '📈'
+
+            info = idx_d.get('info', {})
+            if isinstance(info, dict):
+                # (B) Bybit instrument.symbolType metadata
+                inst = info.get('instrument', {})
+                if isinstance(inst, dict):
+                    st = str(inst.get('symbolType', '')).lower()
+                    if st == 'stock':
+                        return '美股/股权 (Stock)', '📈'
+                    elif st in ('commodity', 'metals'):
+                        return '大宗商品/RWA (Commodity)', '🧈'
+                    elif st in ('index', 'indices', 'forex', 'macro'):
+                        return '指数宏观 (Macro)', '🌐'
+
+                # (C) Gate contract.contractType metadata
+                contract = info.get('contract', {})
+                if isinstance(contract, dict):
+                    ct = str(contract.get('contractType', '')).lower()
+                    if ct in ('stocks', 'stock'):
+                        return '美股/股权 (Stock)', '📈'
+                    elif ct in ('metals', 'commodities', 'commodity'):
+                        return '大宗商品/RWA (Commodity)', '🧈'
+                    elif ct in ('indices', 'index', 'forex'):
+                        return '指数宏观 (Macro)', '🌐'
+
+    # 2. Secondary: Exchange Naming Decorators (e.g. bStock, xStock)
+    if index_data_list:
+        for idx_d in index_data_list:
+            if idx_d and isinstance(idx_d, dict):
+                s_name = (idx_d.get('symbol') or '').upper().split('/')[0]
+                # OKX xStock prefix (e.g. xAAPL, xTSLA)
+                if s_name.startswith('X') and len(s_name) > 3 and s_name[1:] in {'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META'}:
+                    return '美股/股权 (Stock)', '📈'
+                # Gate xStock suffix (e.g. AAPLX)
+                if s_name.endswith('X') and len(s_name) > 3 and s_name[:-1] in {'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMZN', 'GOOGL', 'META'}:
+                    return '美股/股权 (Stock)', '📈'
+
+    # 3. Clean Fallback for other venues (Binance/OKX/Bitget without explicit metadata)
+    CLEAN_STOCKS = {
         'NVDA', 'AAPL', 'TSLA', 'MSFT', 'COIN', 'MSTR', 'OPENAI', 'ANTHROPIC',
         'SPACEX', 'STRIPE', 'GOOGL', 'GOOG', 'META', 'AMZN', 'BABA', 'PLTR',
         'ARM', 'NFLX', 'AMD', 'INTC', 'DIS', 'UBER', 'CRWD', 'SNOW', 'SHOP',
-        'HOOD', 'RDDT', 'COINBASE', 'CIRCL', 'H100', 'FIGMA', 'BYTE', 'TIKTOK',
-        'DATABRICKS', 'SCALE'
+        'HOOD', 'RDDT', 'CIRCL', 'H100', 'FIGMA', 'TIKTOK', 'DATABRICKS'
     }
-    COMMODITIES = {
-        'XAU', 'XAG', 'GOLD', 'SILVER', 'OIL', 'WTI', 'BRENT', 'CRUDE',
-        'COPPER', 'NATGAS', 'GAS', 'PLATINUM', 'PALLADIUM', 'ALUMINUM',
-        'WHEAT', 'CORN', 'SOYBEAN', 'COFFEE', 'SUGAR', 'URANIUM'
+    CLEAN_COMMODITIES = {
+        'XAU', 'XAG', 'GOLD', 'SILVER', 'WTI', 'BRENT', 'CRUDE',
+        'COPPER', 'NATGAS', 'PLATINUM', 'PALLADIUM', 'ALUMINUM',
+        'WHEAT', 'SOYBEAN', 'COFFEE', 'SUGAR', 'URANIUM'
     }
-    MACRO = {
+    CLEAN_MACRO = {
         'SP500', 'US500', 'SPX', 'NDX', 'NQ100', 'US100', 'DOW', 'DJI',
         'DXY', 'EUR', 'GBP', 'JPY', 'CNH', 'AUD', 'CAD', 'CHF', 'FED', 'CPI'
     }
-    if sym in STOCKS:
+
+    if sym in CLEAN_STOCKS:
         return '美股/股权 (Stock)', '📈'
-    elif sym in COMMODITIES:
+    elif sym in CLEAN_COMMODITIES:
         return '大宗商品/RWA (Commodity)', '🧈'
-    elif sym in MACRO:
+    elif sym in CLEAN_MACRO:
         return '指数宏观 (Macro)', '🌐'
-    else:
-        return '纯虚拟币 (Crypto)', '🪙'
+
+    return '纯虚拟币 (Crypto)', '🪙'
 
 def log(msg: str):
     now_cst = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S (UTC+8)')
@@ -470,7 +545,12 @@ def process_spread_candidate(candidate):
 
     # Carry yield per day: Long position pays buy_fr, Short position receives sell_fr
     daily_carry = (sell_fr_val * (24.0 / max(buy_inter, 1))) - (buy_fr_val * (24.0 / max(sell_inter, 1)))
-    cat_name, cat_icon = get_asset_category(symbol)
+    idx_list = []
+    if idx_b and isinstance(idx_b.get('data'), dict):
+        idx_list.append(idx_b['data'])
+    if idx_s and isinstance(idx_s.get('data'), dict):
+        idx_list.append(idx_s['data'])
+    cat_name, cat_icon = get_asset_category(symbol, index_data_list=idx_list)
 
     return {
         'type': 'SPREAD',
@@ -659,7 +739,7 @@ def scan_funding_arbitrage():
                 next_ts = d.get('nextFundingTimestamp')
                 if fr is not None:
                     daily = fr * 24.0 / inter
-                    return sym, ex, fr, inter, daily, next_ts
+                    return sym, ex, fr, inter, daily, next_ts, d
         except Exception:
             pass
         return None
@@ -669,14 +749,15 @@ def scan_funding_arbitrage():
     with ThreadPoolExecutor(max_workers=20) as executor:
         for item in executor.map(fetch_index_fr, tasks):
             if item:
-                sym, ex, fr, inter, daily, next_ts = item
+                sym, ex, fr, inter, daily, next_ts, idx_data = item
                 if sym not in index_rates:
                     index_rates[sym] = {}
                 index_rates[sym][ex] = {
                     'fr': fr,
                     'interval': inter,
                     'daily': daily,
-                    'next_ts': next_ts
+                    'next_ts': next_ts,
+                    'index_data': idx_data
                 }
 
     # Evaluate cross-exchange pairs for each symbol
@@ -754,7 +835,12 @@ def scan_funding_arbitrage():
                 if not (d_ok_a and d_ok_b):
                     continue
 
-                cat_name, cat_icon = get_asset_category(sym)
+                idx_list = []
+                if dA.get('index_data'):
+                    idx_list.append(dA['index_data'])
+                if dB.get('index_data'):
+                    idx_list.append(dB['index_data'])
+                cat_name, cat_icon = get_asset_category(sym, index_data_list=idx_list)
                 qualified_funding.append({
                     'type': 'FUNDING',
                     'symbol': sym,
