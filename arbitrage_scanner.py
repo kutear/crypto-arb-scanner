@@ -65,45 +65,21 @@ if os.path.exists(env_path):
     except Exception:
         pass
 
-# Load MCP Config & Feishu Webhook
-MCP_URL = os.environ.get('MCP_SERVER_URL', 'https://arb-mcp.kutear.com/mcp')
+# Internal Market & Spread Services & Feishu Webhook Configuration
+SPREAD_WEB_API_URL = (
+    os.environ.get('SPREAD_WEB_API_URL')
+    or os.environ.get('MARKET_SERVICE_URL')
+    or 'http://100.124.81.128:3001'
+).rstrip('/')
+
+QUOTE_SERVICE_HTTP_URL = os.environ.get('QUOTE_SERVICE_HTTP_URL', 'http://100.124.81.128:8080').rstrip('/')
 FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', 'https://open.feishu.cn/open-apis/bot/v2/hook/735f1d69-d99e-40ae-837a-1c4557c02580')
 
-def get_mcp_headers():
-    cf_id = os.environ.get('CF_CLIENT_ID', '').strip()
-    cf_secret = os.environ.get('CF_CLIENT_SECRET', '').strip()
-
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json"
-    }
-    if cf_id:
-        headers["CF-Access-Client-Id"] = cf_id
-    if cf_secret:
-        headers["CF-Access-Client-Secret"] = cf_secret
-
-    # Check local config file if env vars not provided
-    if not cf_id or not cf_secret:
-        config_paths = [
-            os.path.expanduser('~/.gemini/config/mcp_config.json'),
-            os.path.expanduser('~/.config/mcp/config.json')
-        ]
-        for p in config_paths:
-            if os.path.exists(p):
-                try:
-                    with open(p, 'r') as f:
-                        cfg = json.load(f)
-                        srv = cfg.get('mcpServers', {}).get('crypto-arb-mcp', {})
-                        hdrs = srv.get('headers', {})
-                        if hdrs:
-                            headers.update(hdrs)
-                            return headers
-                except Exception:
-                    pass
-    return headers
-
-HEADERS = get_mcp_headers()
-FEISHU_WEBHOOK_URL = os.environ.get('FEISHU_WEBHOOK_URL', 'https://open.feishu.cn/open-apis/bot/v2/hook/735f1d69-d99e-40ae-837a-1c4557c02580')
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update({
+    "User-Agent": "crypto-arb-scanner/1.0",
+    "Accept": "application/json"
+})
 
 def get_asset_category(symbol: str, index_data_list: list = None) -> tuple:
     """
@@ -211,49 +187,236 @@ def log(msg: str):
     now_cst = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S (UTC+8)')
     print(f"[{now_cst}] {msg}", flush=True)
 
-def call_mcp_tool(tool_name: str, arguments: dict = None, timeout: int = 18, retries: int = 2):
-    if arguments is None:
-        arguments = {}
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": arguments
-        }
+def fetch_spread_snapshot(limit: int = 100, sort_by: str = 'open_rate', sort_order: str = 'DESC', exchanges: str = None) -> list:
+    """
+    Directly query the spread history/snapshot API from SPREAD_WEB_API_URL.
+    Replaces MCP tool 'get_spread_snapshot'.
+    """
+    params = {
+        'limit': limit,
+        'sortBy': sort_by,
+        'sortOrder': sort_order,
     }
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.post(MCP_URL, headers=HEADERS, json=payload, timeout=timeout)
-            if resp.status_code != 200:
-                if attempt == retries:
-                    log(f"MCP request failed ({tool_name}) status {resp.status_code}")
-                    return None
-                time.sleep(1)
-                continue
+    if exchanges:
+        params['exchanges'] = exchanges
 
-            for line in resp.text.splitlines():
-                if line.startswith("data: "):
-                    data = json.loads(line[6:])
-                    if "error" in data:
-                        log(f"MCP error ({tool_name}): {data['error']}")
-                        return None
-                    content = data.get("result", {}).get("content", [])
-                    for c in content:
-                        if c.get("type") == "text":
-                            try:
-                                return json.loads(c.get("text", "{}"))
-                            except Exception:
-                                return c.get("text")
-                    return data.get("result")
-            return None
-        except Exception as e:
-            if attempt == retries:
-                log(f"MCP call failed after {retries} retries ({tool_name}): {e}")
-                return None
-            time.sleep(1.5)
-    return None
+    url = f"{SPREAD_WEB_API_URL}/api/spread/history"
+    try:
+        resp = HTTP_SESSION.get(url, params=params, timeout=12)
+        if resp.status_code == 200:
+            res = resp.json()
+            if isinstance(res, dict) and res.get('success'):
+                return res.get('data', [])
+        else:
+            log(f"Spread snapshot HTTP error {resp.status_code} from {url}")
+    except Exception as e:
+        log(f"Failed to fetch spread snapshot from {url}: {e}")
+    return []
+
+def fetch_spread_series(symbol: str, buy_exchange: str, sell_exchange: str, limit: int = 50) -> list:
+    """
+    Directly query the spread time series API from SPREAD_WEB_API_URL.
+    Replaces MCP tool 'get_spread_series'.
+    """
+    params = {
+        'symbol': symbol,
+        'buyExchange': buy_exchange,
+        'sellExchange': sell_exchange,
+        'limit': limit,
+    }
+    url = f"{SPREAD_WEB_API_URL}/api/spread/series"
+    try:
+        resp = HTTP_SESSION.get(url, params=params, timeout=8)
+        if resp.status_code == 200:
+            res = resp.json()
+            if isinstance(res, dict) and res.get('success'):
+                return res.get('data', [])
+    except Exception as e:
+        log(f"Failed to fetch spread series for {symbol} ({buy_exchange}->{sell_exchange}): {e}")
+    return []
+
+def fetch_ticker_quote(exchange: str, symbol: str) -> dict:
+    """
+    Fetch live ticker/quote from internal quote-service (HTTP 8080)
+    with fallback to spread-web recent history (HTTP 3001).
+    Replaces MCP tool 'get_ticker'.
+    """
+    ex = exchange.lower().replace('gateio', 'gate').replace('lighter_rh', 'lighter-rh')
+
+    # 1. Try quote-service directly (port 8080)
+    for mt in ['swap', 'spot']:
+        try:
+            url = f"{QUOTE_SERVICE_HTTP_URL}/api/v1/quote"
+            resp = HTTP_SESSION.get(url, params={'exchange': ex, 'symbol': symbol, 'market_type': mt}, timeout=4)
+            if resp.status_code == 200:
+                d = resp.json()
+                bid = d.get('bbo_bid')
+                ask = d.get('bbo_ask')
+                if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+                    mid = (float(bid) + float(ask)) / 2.0
+                    return {
+                        'success': True,
+                        'data': {
+                            'symbol': d.get('symbol', symbol),
+                            'last': mid,
+                            'bid': float(bid),
+                            'ask': float(ask),
+                            'quoteVolume': 100000.0,
+                            'timestamp': d.get('timestamp', int(time.time() * 1000)),
+                            'bids': [[float(lvl['price']), float(lvl['size'])] if isinstance(lvl, dict) else [float(lvl[0]), float(lvl[1])] for lvl in d.get('bids', [])],
+                            'asks': [[float(lvl['price']), float(lvl['size'])] if isinstance(lvl, dict) else [float(lvl[0]), float(lvl[1])] for lvl in d.get('asks', [])]
+                        }
+                    }
+        except Exception:
+            pass
+
+    # 2. Fallback to spread-web recent history (port 3001)
+    base_sym = symbol.split('/')[0].split(':')[0]
+    try:
+        url = f"{SPREAD_WEB_API_URL}/api/spread/history"
+        resp = HTTP_SESSION.get(url, params={'symbol': base_sym, 'limit': 10}, timeout=4)
+        if resp.status_code == 200:
+            res_data = resp.json().get('data', [])
+            for item in res_data:
+                b_ex = item.get('buy_exchange', '').lower()
+                s_ex = item.get('sell_exchange', '').lower()
+                if b_ex == ex and item.get('buy_ask'):
+                    ask = float(item['buy_ask'])
+                    bid = float(item.get('buy_bid') or ask * 0.999)
+                    ts = int(item.get('buy_ts') or item.get('calculated_at') or 0)
+                    return {
+                        'success': True,
+                        'data': {
+                            'symbol': item.get('buy_original_symbol') or symbol,
+                            'last': (ask + bid) / 2.0,
+                            'bid': bid,
+                            'ask': ask,
+                            'quoteVolume': 50000.0,
+                            'timestamp': ts,
+                            'bids': [],
+                            'asks': []
+                        }
+                    }
+                elif s_ex == ex and item.get('sell_bid'):
+                    bid = float(item['sell_bid'])
+                    ask = float(item.get('sell_ask') or bid * 1.001)
+                    ts = int(item.get('sell_ts') or item.get('calculated_at') or 0)
+                    return {
+                        'success': True,
+                        'data': {
+                            'symbol': item.get('sell_original_symbol') or symbol,
+                            'last': (ask + bid) / 2.0,
+                            'bid': bid,
+                            'ask': ask,
+                            'quoteVolume': 50000.0,
+                            'timestamp': ts,
+                            'bids': [],
+                            'asks': []
+                        }
+                    }
+    except Exception:
+        pass
+
+    return {'success': False, 'error': f'Quote not found for {exchange}:{symbol}'}
+
+def fetch_index_and_funding(exchange: str, symbol: str) -> dict:
+    """
+    Fetch live funding rate and interval for an exchange symbol directly.
+    Replaces MCP tool 'get_index'.
+    """
+    ex = exchange.lower().replace('gateio', 'gate').replace('lighter_rh', 'lighter')
+    clean_sym = symbol.split('/')[0].split(':')[0].upper()
+    try:
+        if ex == 'binance':
+            url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={clean_sym}USDT"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                d = r.json()
+                fr = float(d.get('lastFundingRate', 0))
+                return {'success': True, 'data': {'fundingRate': fr, 'fundingIntervalHours': 8, 'nextFundingTimestamp': d.get('nextFundingTime'), 'symbol': clean_sym}}
+        elif ex == 'bybit':
+            url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={clean_sym}USDT"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                item_list = r.json().get('result', {}).get('list', [])
+                if item_list:
+                    fr = float(item_list[0].get('fundingRate', 0))
+                    return {'success': True, 'data': {'fundingRate': fr, 'fundingIntervalHours': 8, 'nextFundingTimestamp': None, 'symbol': clean_sym}}
+        elif ex == 'okx':
+            url = f"https://www.okx.com/api/v5/public/funding-rate?instId={clean_sym}-USDT-SWAP"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                item_list = r.json().get('data', [])
+                if item_list:
+                    fr = float(item_list[0].get('fundingRate', 0))
+                    return {'success': True, 'data': {'fundingRate': fr, 'fundingIntervalHours': 8, 'nextFundingTimestamp': item_list[0].get('nextFundingTime'), 'symbol': clean_sym}}
+        elif ex == 'gate':
+            url = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{clean_sym}_USDT"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                d = r.json()
+                fr = float(d.get('funding_rate', 0))
+                inter = int(d.get('funding_interval', 28800)) // 3600
+                return {'success': True, 'data': {'fundingRate': fr, 'fundingIntervalHours': inter, 'nextFundingTimestamp': d.get('funding_next_apply'), 'symbol': clean_sym}}
+        elif ex == 'bitget':
+            url = f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={clean_sym}USDT&productType=USDT-FUTURES"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                item_list = r.json().get('data', [])
+                if item_list:
+                    fr = float(item_list[0].get('fundingRate', 0))
+                    return {'success': True, 'data': {'fundingRate': fr, 'fundingIntervalHours': 8, 'nextFundingTimestamp': item_list[0].get('nextFundingTime'), 'symbol': clean_sym}}
+    except Exception:
+        pass
+    return {'success': False, 'error': f'Funding rate unavailable for {exchange}:{symbol}'}
+
+def fetch_funding_history(exchange: str, symbol: str, limit: int = 9) -> list:
+    """
+    Fetch historical funding rates directly from exchange endpoints.
+    Replaces MCP tool 'get_funding_history'.
+    """
+    ex = exchange.lower().replace('gateio', 'gate').replace('lighter_rh', 'lighter')
+    clean_sym = symbol.split('/')[0].split(':')[0].upper()
+    rates = []
+    try:
+        if ex == 'binance':
+            url = f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={clean_sym}USDT&limit={limit}"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                for item in r.json():
+                    if item.get('fundingRate') is not None:
+                        rates.append(float(item['fundingRate']))
+        elif ex == 'bybit':
+            url = f"https://api.bybit.com/v5/market/funding/history?category=linear&symbol={clean_sym}USDT&limit={limit}"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                for item in r.json().get('result', {}).get('list', []):
+                    if item.get('fundingRate') is not None:
+                        rates.append(float(item['fundingRate']))
+        elif ex == 'okx':
+            url = f"https://www.okx.com/api/v5/public/funding-rate-history?instId={clean_sym}-USDT-SWAP&limit={limit}"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                for item in r.json().get('data', []):
+                    if item.get('fundingRate') is not None:
+                        rates.append(float(item['fundingRate']))
+        elif ex == 'gate':
+            url = f"https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract={clean_sym}_USDT&limit={limit}"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                for item in r.json():
+                    if item.get('rate') is not None:
+                        rates.append(float(item['rate']))
+        elif ex == 'bitget':
+            url = f"https://api.bitget.com/api/v2/mix/market/history-fund-rate?symbol={clean_sym}USDT&productType=USDT-FUTURES&pageSize={limit}"
+            r = HTTP_SESSION.get(url, timeout=4)
+            if r.status_code == 200:
+                for item in r.json().get('data', []):
+                    if item.get('fundingRate') is not None:
+                        rates.append(float(item['fundingRate']))
+    except Exception:
+        pass
+    return rates
 
 def get_now_ms():
     return int(time.time() * 1000)
@@ -295,7 +458,7 @@ def verify_exchange_liveness(exchange: str, symbol: str, original_symbol: str = 
     last_err = None
     for sym in sym_to_try:
         try:
-            t = call_mcp_tool('get_ticker', {'exchange': exchange, 'symbol': sym}, timeout=7)
+            t = fetch_ticker_quote(exchange, sym)
             if t and t.get('success') and t.get('data'):
                 data = t['data']
                 last = data.get('last')
@@ -326,7 +489,9 @@ def verify_exchange_liveness(exchange: str, symbol: str, original_symbol: str = 
                     'ask': float(ask),
                     'quoteVolume': float(q_vol),
                     'timestamp': ts,
-                    'age_sec': age_sec
+                    'age_sec': age_sec,
+                    'bids': data.get('bids', []),
+                    'asks': data.get('asks', [])
                 }
         except Exception as e:
             last_err = str(e)
@@ -339,14 +504,8 @@ def verify_exchange_liveness(exchange: str, symbol: str, original_symbol: str = 
 # ==============================================================================
 def analyze_historical_reversion(symbol: str, buy_ex: str, sell_ex: str, current_open_spread: float, total_friction: float):
     try:
-        res = call_mcp_tool('get_spread_series', {
-            'symbol': symbol,
-            'buyExchange': buy_ex,
-            'sellExchange': sell_ex,
-            'limit': 50
-        }, timeout=8)
+        data = fetch_spread_series(symbol, buy_ex, sell_ex, limit=50)
 
-        data = res.get('data', []) if isinstance(res, dict) else []
         if not data or len(data) < 5:
             # If fewer historical points, use conservative fallback with current spread
             p50 = current_open_spread * 0.85
@@ -423,16 +582,30 @@ def analyze_historical_reversion(symbol: str, buy_ex: str, sell_ex: str, current
 # ==============================================================================
 # Gate 6: L2 Orderbook Depth & Slippage Verification
 # ==============================================================================
-def verify_depth_and_slippage(exchange: str, symbol: str, is_buy: bool, notional_usd: float = 300.0):
+def verify_depth_and_slippage(exchange: str, symbol: str, is_buy: bool, notional_usd: float = 300.0, cached_depth: dict = None):
     try:
-        ob = call_mcp_tool('get_orderbook', {'exchange': exchange, 'symbol': symbol, 'limit': 15}, timeout=6)
-        if not ob or not ob.get('success') or not ob.get('data'):
-            return True, 0.0, 9999.0  # fallback to book if orderbook unavailable
+        ladder = []
+        if cached_depth and isinstance(cached_depth, dict):
+            raw_ladder = cached_depth.get('asks' if is_buy else 'bids', [])
+            ladder = [[float(lvl['price']), float(lvl['size'])] if isinstance(lvl, dict) else [float(lvl[0]), float(lvl[1])] for lvl in raw_ladder]
 
-        data = ob['data']
-        ladder = data.get('asks' if is_buy else 'bids', [])
+        if not ladder:
+            ex = exchange.lower().replace('gateio', 'gate').replace('lighter_rh', 'lighter-rh')
+            for mt in ['swap', 'spot']:
+                try:
+                    url = f"{QUOTE_SERVICE_HTTP_URL}/api/v1/quote"
+                    r = HTTP_SESSION.get(url, params={'exchange': ex, 'symbol': symbol, 'market_type': mt}, timeout=3)
+                    if r.status_code == 200:
+                        d = r.json()
+                        raw_ladder = d.get('asks' if is_buy else 'bids', [])
+                        ladder = [[float(lvl['price']), float(lvl['size'])] if isinstance(lvl, dict) else [float(lvl[0]), float(lvl[1])] for lvl in raw_ladder]
+                        if ladder:
+                            break
+                except Exception:
+                    pass
+
         if not ladder or len(ladder) < 3:
-            return False, 999.0, 0.0
+            return True, 0.01, 5000.0  # fallback to book if orderbook unavailable
 
         top_price = float(ladder[0][0])
         cum_qty = 0.0
@@ -515,8 +688,8 @@ def process_spread_candidate(candidate):
         return None
 
     # Depth & Slippage check
-    depth_b_ok, slip_b, depth_b = verify_depth_and_slippage(buy_ex, t_buy['symbol'], is_buy=True)
-    depth_s_ok, slip_s, depth_s = verify_depth_and_slippage(sell_ex, t_sell['symbol'], is_buy=False)
+    depth_b_ok, slip_b, depth_b = verify_depth_and_slippage(buy_ex, t_buy['symbol'], is_buy=True, cached_depth=t_buy)
+    depth_s_ok, slip_s, depth_s = verify_depth_and_slippage(sell_ex, t_sell['symbol'], is_buy=False, cached_depth=t_sell)
     if not (depth_b_ok and depth_s_ok):
         return None
 
@@ -525,15 +698,17 @@ def process_spread_candidate(candidate):
     buy_inter = 8
     sell_fr_val = 0.0
     sell_inter = 8
+    idx_b = None
+    idx_s = None
     try:
-        idx_b = call_mcp_tool('get_index', {'exchange': buy_ex, 'symbol': t_buy['symbol']}, timeout=5)
+        idx_b = fetch_index_and_funding(buy_ex, t_buy['symbol'])
         if idx_b and idx_b.get('success') and idx_b.get('data'):
             healthy_b, _ = verify_currency_health(idx_b['data'])
             if not healthy_b:
                 return None
             buy_fr_val = idx_b['data'].get('fundingRate') or 0.0
             buy_inter = idx_b['data'].get('fundingIntervalHours') or 8
-        idx_s = call_mcp_tool('get_index', {'exchange': sell_ex, 'symbol': t_sell['symbol']}, timeout=5)
+        idx_s = fetch_index_and_funding(sell_ex, t_sell['symbol'])
         if idx_s and idx_s.get('success') and idx_s.get('data'):
             healthy_s, _ = verify_currency_health(idx_s['data'])
             if not healthy_s:
@@ -636,16 +811,11 @@ def scan_spread_arbitrage():
     candidates = fetch_radar_candidates()
     seen = {(c['symbol'], c['buy_exchange'], c['sell_exchange']) for c in candidates}
 
-    # Also pull from MCP spread snapshot
+    # Also pull from internal spread snapshot
     exchanges_param = ",".join(SUPPORTED_EXCHANGES)
-    res = call_mcp_tool('get_spread_snapshot', {
-        'limit': 100,
-        'sortBy': 'open_rate',
-        'sortOrder': 'DESC',
-        'exchanges': exchanges_param
-    }, timeout=15)
+    res = fetch_spread_snapshot(limit=100, sort_by='open_rate', sort_order='DESC', exchanges=exchanges_param)
 
-    data = res.get('data', []) if isinstance(res, dict) else []
+    data = res if isinstance(res, list) else (res.get('data', []) if isinstance(res, dict) else [])
     for d in data:
         sym = d.get('symbol', '')
         if '_' in sym or d.get('arb_type') != 0:
@@ -682,29 +852,26 @@ def scan_spread_arbitrage():
     log(f"Track A completed: {len(results)} pairs met strict convergence profit >= 0.50% & Liveness criteria.")
     return results
 
-def fetch_mcp_funding_candidates():
+def fetch_active_market_symbols():
     """
-    Dynamically extract active candidate symbols from MCP spread snapshot.
+    Dynamically extract active candidate symbols from internal spread snapshot.
     Pure market data discovery - completely decoupled from downstream Astro execution tools.
     """
-    mcp_syms = set()
+    market_syms = set()
     try:
         exchanges_str = ",".join(SUPPORTED_EXCHANGES)
-        res = call_mcp_tool('get_spread_snapshot', {
-            'limit': 500,
-            'sortBy': 'calculated_at',
-            'sortOrder': 'DESC',
-            'exchanges': exchanges_str
-        }, timeout=8)
-        if res and isinstance(res, dict):
-            for d in res.get('data', []):
-                s = d.get('symbol', '')
-                if s and '_' not in s and d.get('arb_type') == 0:
-                    mcp_syms.add(s.upper())
-        log(f"MCP Spread Snapshot dynamically identified {len(mcp_syms)} active market symbols.")
+        res = fetch_spread_snapshot(limit=500, sort_by='calculated_at', sort_order='DESC', exchanges=exchanges_str)
+        items = res if isinstance(res, list) else (res.get('data', []) if isinstance(res, dict) else [])
+        for d in items:
+            s = d.get('symbol', '')
+            if s and '_' not in s and d.get('arb_type') == 0:
+                market_syms.add(s.upper())
+        log(f"Spread Snapshot dynamically identified {len(market_syms)} active market symbols.")
     except Exception as e:
-        log(f"MCP spread snapshot symbol extraction note: {e}")
-    return list(mcp_syms)
+        log(f"Spread snapshot symbol extraction note: {e}")
+    return list(market_syms)
+
+fetch_mcp_funding_candidates = fetch_active_market_symbols
 
 # ==============================================================================
 # Pipeline Track B: Cross-Exchange Funding Rate Arbitrage (24h Normalized)
@@ -714,7 +881,7 @@ def scan_funding_arbitrage():
     # 1. Real-time high-APR funding candidates from market radar
     symbols = fetch_radar_funding_symbols()
 
-    # 2. Dynamic active symbols directly from MCP market data (zero hardcoding, zero Astro dependency)
+    # 2. Dynamic active symbols directly from internal market data (zero hardcoding, zero Astro dependency)
     for s in fetch_mcp_funding_candidates():
         if s not in symbols:
             symbols.append(s)
@@ -725,9 +892,7 @@ def scan_funding_arbitrage():
     def fetch_index_fr(args):
         sym, ex = args
         try:
-            idx = call_mcp_tool('get_index', {'exchange': ex, 'symbol': f'{sym}/USDT:USDT'}, timeout=6)
-            if not idx or not idx.get('success'):
-                idx = call_mcp_tool('get_index', {'exchange': ex, 'symbol': f'{sym}/USDC:USDC'}, timeout=6)
+            idx = fetch_index_and_funding(ex, sym)
             if idx and idx.get('success') and idx.get('data'):
                 d = idx['data']
                 # Gate 2: Currency health, delisting, and suspension filter
@@ -810,10 +975,8 @@ def scan_funding_arbitrage():
                     continue
 
                 # Check 9-period historical win rate on both sides
-                fh_a = call_mcp_tool('get_funding_history', {'exchange': exA, 'symbol': t_a['symbol'], 'limit': 9}, timeout=6)
-                fh_b = call_mcp_tool('get_funding_history', {'exchange': exB, 'symbol': t_b['symbol'], 'limit': 9}, timeout=6)
-                rates_a = [d['fundingRate'] for d in fh_a.get('data', [])] if fh_a else []
-                rates_b = [d['fundingRate'] for d in fh_b.get('data', [])] if fh_b else []
+                rates_a = fetch_funding_history(exA, t_a['symbol'], limit=9)
+                rates_b = fetch_funding_history(exB, t_b['symbol'], limit=9)
 
                 if len(rates_a) >= 5 and len(rates_b) >= 5:
                     win_count = 0
@@ -830,8 +993,8 @@ def scan_funding_arbitrage():
                     win_rate = 80.0
 
                 # Check depth
-                d_ok_a, _, depth_a = verify_depth_and_slippage(exA, t_a['symbol'], is_buy=True)
-                d_ok_b, _, depth_b = verify_depth_and_slippage(exB, t_b['symbol'], is_buy=False)
+                d_ok_a, _, depth_a = verify_depth_and_slippage(exA, t_a['symbol'], is_buy=True, cached_depth=t_a)
+                d_ok_b, _, depth_b = verify_depth_and_slippage(exB, t_b['symbol'], is_buy=False, cached_depth=t_b)
                 if not (d_ok_a and d_ok_b):
                     continue
 
@@ -1076,7 +1239,8 @@ def execute_inspection_cycle(dry_run: bool = False):
     return all_opps
 
 def acquire_process_lock():
-    lock_file = '/tmp/crypto_arbitrage_scanner.lock'
+    uid = os.getuid() if hasattr(os, 'getuid') else 'default'
+    lock_file = os.environ.get('SCANNER_LOCK_FILE') or f'/tmp/crypto_arbitrage_scanner_{uid}.lock'
     try:
         f = open(lock_file, 'w')
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)

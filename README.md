@@ -29,28 +29,28 @@ uv run arbitrage_scanner.py --once
 - 调度配置：`cron: '15 * * * *'`（每小时第 15 分钟错峰自动巡检，规避整点拥堵）；
 - 支持在 Actions 界面随时单次手动触发（`workflow_dispatch`）。
 
-### 必填 Secrets 配置
+### Secrets / 环境变量配置
 
-由于本项目为公开（Public）仓库，代码内已**彻底剔除所有敏感凭据与硬编码 Token**。请在 GitHub 仓库主页配置以下 Secrets：
+请在 GitHub 仓库主页配置以下 Secrets（或在本地 `.env` 中配置环境变量）：
 
-前往 GitHub 仓库：**Settings** $\to$ **Secrets and variables** $\to$ **Actions** $\to$ 点击 **New repository secret**，添加以下三个变量：
+前往 GitHub 仓库：**Settings** $\to$ **Secrets and variables** $\to$ **Actions** $\to$ 点击 **New repository secret**：
 
-| Secret 名称 | 必须 | 说明 | 示例值 |
+| Secret / 环境变量 | 必须 | 说明 | 默认值 / 示例值 |
 | :--- | :---: | :--- | :--- |
 | `FEISHU_WEBHOOK_URL` | **是** | 飞书自定义机器人 Webhook 地址 | `https://open.feishu.cn/open-apis/bot/v2/hook/...` |
-| `CF_CLIENT_ID` | **是** | Cloudflare Access Client ID | `<your-cf-access-client-id>` |
-| `CF_CLIENT_SECRET` | **是** | Cloudflare Access Client Secret | `<your-cf-access-client-secret>` |
-| `MCP_SERVER_URL` | 否 | MCP 服务端接入点（默认已内置） | `https://arb-mcp.kutear.com/mcp` |
+| `SPREAD_WEB_API_URL` | 否 | 内网价差分析与历史序列服务 API | `http://100.124.81.128:3001` |
+| `QUOTE_SERVICE_HTTP_URL` | 否 | 内网高并发行情与 L2 深度服务 API | `http://100.124.81.128:8080` |
+
+> 💡 **架构升级说明**：已彻底废弃 Cloudflare Worker 外部网关（`arb-mcp.kutear.com`），全面改用内网专线直连，杜绝 HTTP 429 Rate Limit 限流异常。
 
 ---
 
 ## 🛠️ 本地运行与调试
 
-### 1. 设置环境变量
+### 1. 设置环境变量 (或直接使用 `.env`)
 ```bash
-export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/..."
-export CF_CLIENT_ID="<your-cf-access-client-id>"
-export CF_CLIENT_SECRET="<your-cf-access-client-secret>"
+cp .env.example .env
+# 编辑 .env 配置 FEISHU_WEBHOOK_URL、SPREAD_WEB_API_URL 等
 ```
 
 ### 2. 使用 uv 运行
