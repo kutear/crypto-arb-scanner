@@ -30,8 +30,7 @@ jobs:
       - name: Execute Arbitrage Inspection via uv
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          CF_CLIENT_ID: ${{ secrets.CF_CLIENT_ID }}
-          CF_CLIENT_SECRET: ${{ secrets.CF_CLIENT_SECRET }}
-          MCP_SERVER_URL: ${{ secrets.MCP_SERVER_URL || 'https://arb-mcp.kutear.com/mcp' }}
+          SPREAD_WEB_API_URL: ${{ secrets.SPREAD_WEB_API_URL || 'http://100.124.81.128:3001' }}
+          QUOTE_SERVICE_HTTP_URL: ${{ secrets.QUOTE_SERVICE_HTTP_URL || 'http://100.124.81.128:8080' }}
         run: |
           uv run arbitrage_scanner.py --once
